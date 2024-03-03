@@ -1,48 +1,60 @@
-using Microsoft.OpenApi.Models;
-using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using System;
+using System.Collections.Generic;
+using System.Security.Claims;
+using System.Text;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.AspNetCore.Http;
-using System.Linq;
-using TodoApi;
 using Microsoft.AspNetCore.Mvc;
-
+using TodoApi;
+using System.Security.Cryptography;
+using System.IdentityModel.Tokens.Jwt;
 
 var builder = WebApplication.CreateBuilder(args);
+
+var key = GenerateStrongKey();
 
 builder.Services.AddDbContext<ToDoDbContext>(options =>
     options.UseMySql("server=localhost;database=tasks;user=maayan;password=maayan",
         new MySqlServerVersion(new Version(8, 0, 36))));
 
-
-// Add CORS policy
 builder.Services.AddCors(options =>
 {
-     options.AddPolicy("AllowAnyOrigin",
-         builder =>
-         {
-              builder.AllowAnyOrigin()
-                    .AllowAnyMethod()
-                    .AllowAnyHeader();
-         });
+    options.AddPolicy("AllowAnyOrigin",
+        builder =>
+        {
+            builder.AllowAnyOrigin()
+                .AllowAnyMethod()
+                .AllowAnyHeader();
+        });
 });
 
-// Register Swagger services
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(key),
+            ValidateIssuer = false,
+            ValidateAudience = false
+        };
+    });
+
 var app = builder.Build();
 
-// Define your routes
-
-//     Console.ForegroundColor = ConsoleColor.Green;
-//     Console.WriteLine("********************************************");
-//     Console.WriteLine("*               My Server Work             *");
-//     Console.WriteLine("********************************************");
-//     Console.ResetColor();  
 app.MapGet("/", (HttpContext context) =>
 {
+    Console.ForegroundColor = ConsoleColor.Green;
+    Console.WriteLine("********************************************");
+    Console.WriteLine("*               My Server Work             *");
+    Console.WriteLine("********************************************");
+    Console.ResetColor();
     context.Response.ContentType = "text/html";
 
     return @"
@@ -52,6 +64,7 @@ app.MapGet("/", (HttpContext context) =>
             <meta charset=""UTF-8"">
             <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
             <title>My Server Work</title>
+
             <style>
                 body {
                     font-family: Arial, sans-serif;
@@ -77,31 +90,46 @@ app.MapGet("/", (HttpContext context) =>
     ";
 });
 
+app.MapPost("/register", async (User user, [FromServices] ToDoDbContext dbContext) =>
+{
+    dbContext.Users.Add(user);
+    await dbContext.SaveChangesAsync();
+    return Results.Ok("User registered successfully");
+});
+
+app.MapPost("/login", async (User user, [FromServices] ToDoDbContext dbContext) =>
+{
+    var existingUser = await dbContext.Users.FirstOrDefaultAsync(u => u.Username == user.Username && u.Password == user.Password);
+    if (existingUser == null)
+        return Results.BadRequest("Invalid username or password");
+
+    var token = GenerateJwtToken(existingUser, key);
+    return Results.Ok(new { Token = token });
+});
+
 app.MapGet("/tasks", async ([FromServices] ToDoDbContext _context) =>
 {
-     var items = await _context.items.ToListAsync();
-     return Results.Ok(items);
+    var items = await _context.Items.ToListAsync();
+    return Results.Ok(items);
 });
 
 app.MapPost("/tasks", async (Item item, [FromServices] ToDoDbContext _context) =>
 {
-    var itemToAdd = new Item { Name = item.Name ,IsComplete=false};
-    var newItem = await _context.items.AddAsync(itemToAdd);
+    var itemToAdd = new Item { Name = item.Name, IsComplete = false };
+    var newItem = await _context.Items.AddAsync(itemToAdd);
     await _context.SaveChangesAsync();
     return Results.Ok(newItem.Entity);
 });
 
-
-app.MapPut("/tasks/{id}", async (int id,[FromServices] ToDoDbContext _context) =>
+app.MapPut("/tasks/{id}", async (int id, [FromServices] ToDoDbContext _context) =>
 {
-    
-     var itemToUpdate = await _context.items.FindAsync(id);
+    var itemToUpdate = await _context.Items.FindAsync(id);
     if (itemToUpdate == null)
     {
         return Results.NotFound();
     }
 
-    itemToUpdate.IsComplete = ! itemToUpdate.IsComplete;
+    itemToUpdate.IsComplete = !itemToUpdate.IsComplete;
 
     await _context.SaveChangesAsync();
     return Results.Ok(itemToUpdate);
@@ -109,26 +137,53 @@ app.MapPut("/tasks/{id}", async (int id,[FromServices] ToDoDbContext _context) =
 
 app.MapDelete("/tasks/{id}", async (int id, [FromServices] ToDoDbContext _context) =>
 {
-     var item = await _context.items.FindAsync(id);
-     if (item == null)
-     {
-          return Results.NotFound();
-     }
+    var item = await _context.Items.FindAsync(id);
+    if (item == null)
+    {
+        return Results.NotFound();
+    }
 
-     _context.items.Remove(item);
-     await _context.SaveChangesAsync();
-     return Results.Ok(item);
+    _context.Items.Remove(item);
+    await _context.SaveChangesAsync();
+    return Results.Ok(item);
 });
 
-
-//  Swagger
-//http://localhost:5163/swagger/index.html
 if (app.Environment.IsDevelopment())
 {
-     app.UseSwagger();
-     app.UseSwaggerUI();
+    app.UseSwagger();
+    app.UseSwaggerUI();
 }
-// Apply CORS middleware
+
 app.UseCors("AllowAnyOrigin");
+app.UseAuthentication();
+app.UseAuthorization();
 
 app.Run();
+
+// Method to generate a strong key
+byte[] GenerateStrongKey()
+{
+    using var rng = RandomNumberGenerator.Create();
+    var keyBytes = new byte[32]; // 256 bits
+    rng.GetBytes(keyBytes);
+    return keyBytes;
+}
+
+string GenerateJwtToken(User user, byte[] key)
+{
+    var tokenHandler = new JwtSecurityTokenHandler();
+
+    var tokenDescriptor = new SecurityTokenDescriptor
+    {
+        Subject = new ClaimsIdentity(new Claim[]
+        {
+            new Claim(ClaimTypes.Name, user.Username),
+            new Claim(ClaimTypes.NameIdentifier, user.Id.ToString())
+        }),
+        Expires = DateTime.UtcNow.AddHours(1), // Token expiration time
+        SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
+    };
+
+    var token = tokenHandler.CreateToken(tokenDescriptor);
+    return tokenHandler.WriteToken(token);
+}
